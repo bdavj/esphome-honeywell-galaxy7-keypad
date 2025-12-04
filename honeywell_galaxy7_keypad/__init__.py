@@ -5,6 +5,7 @@ from esphome.const import CONF_ID
 
 CONF_SCREEN_NUMBER = "screen_number"
 CONF_DISPLAY_TEXT = "display_text"
+CONF_BACKLIGHT_TIMEOUT = "backlight_timeout"
 
 # Honeywell Galaxy 7 Keypad - bdavj
 
@@ -26,6 +27,7 @@ CONFIG_SCHEMA = (
             cv.Optional(
                 CONF_DISPLAY_TEXT, default="ESP-HOME|Initializing"
             ): cv.string,
+            cv.Optional(CONF_BACKLIGHT_TIMEOUT, default="15s"): cv.positive_time_period_milliseconds,
         }
     )
     .extend(uart.UART_DEVICE_SCHEMA)
@@ -54,3 +56,4 @@ async def to_code(config):
 
     cg.add(var.set_display_text(config[CONF_DISPLAY_TEXT]))
 
+    cg.add(var.set_backlight_timeout(config[CONF_BACKLIGHT_TIMEOUT]))
