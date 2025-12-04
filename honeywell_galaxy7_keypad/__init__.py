@@ -4,6 +4,7 @@ import esphome.config_validation as cv
 from esphome.const import CONF_ID
 
 CONF_SCREEN_NUMBER = "screen_number"
+CONF_DISPLAY_TEXT = "display_text"
 
 # Honeywell Galaxy 7 Keypad - bdavj
 
@@ -22,6 +23,9 @@ CONFIG_SCHEMA = (
             cv.GenerateID(): cv.declare_id(HoneywellGalaxy7Keypad),
             cv.Optional(CONF_RS485_RX_ID): cv.use_id(text_sensor.TextSensor),
             cv.Optional(CONF_SCREEN_NUMBER, default=2): cv.int_range(min=1, max=4),
+            cv.Optional(
+                CONF_DISPLAY_TEXT, default="ESP-HOME|Initializing"
+            ): cv.string,
         }
     )
     .extend(uart.UART_DEVICE_SCHEMA)
@@ -48,5 +52,5 @@ async def to_code(config):
     device_id = 0x10 + (screen_number - 1) * 0x10
     cg.add(var.set_device_id(device_id))
 
-    # ❌ NO cg.add_api_service HERE
-    # The API service itself is declared in YAML and calls var.api_write_rs485()
+    cg.add(var.set_display_text(config[CONF_DISPLAY_TEXT]))
+
