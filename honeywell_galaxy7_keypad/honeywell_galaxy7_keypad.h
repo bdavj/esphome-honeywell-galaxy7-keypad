@@ -86,6 +86,9 @@ class HoneywellGalaxy7Keypad : public uart::UARTDevice, public Component {
   uint8_t beep_quiet_period_{0x00};
   uint8_t screen_seq_flag_{0x00};
 
+  bool need_reinit_after_f2_{false};
+  bool key_ack_pending_{false};       // NEW: we owe an ACK to a key
+  uint8_t ack_pending_code_{0x00};    // NEW: raw F4 code for that key
 
   std::vector<uint8_t> rx_buf_;
 };

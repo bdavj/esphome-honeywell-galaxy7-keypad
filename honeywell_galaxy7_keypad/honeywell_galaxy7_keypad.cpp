@@ -176,6 +176,28 @@ void HoneywellGalaxy7Keypad::loop() {
   if (!this->awaiting_reply_) {
     LastCmd cmd_to_send = CMD_NONE;
 
+    // Highest priority: recover from a bad screen by doing a re-init poll
+    if (this->need_reinit_after_f2_) {
+      ESP_LOGW(TAG, "Performing re-init after F2");
+
+      // Send the same 00 0F you use as init/status poll
+      this->send_frame({this->device_id_, 0x00, 0x0F});
+      this->last_cmd_       = CMD_POLL_00;
+      this->awaiting_reply_ = true;
+      this->last_tx_time_   = now;
+      this->last_init_poll_ = now;
+
+      // Reset our “known-good” protocol state
+      this->ack_toggle_      = 0x02;  // first ACK after re-init = uses 0x02 bit
+      this->screen_seq_flag_ = 0x00;  // so next screen sets 0x80
+      this->need_reinit_after_f2_ = false;
+
+      this->rx_buf_.clear();
+      this->screen_dirty_ = true;
+
+      return;  // don't consider any other commands this loop
+    }
+
     // a) second init poll (00 0F) once after delay
     if (!this->sent_second_init_ && (now - this->last_init_poll_) >= INIT_POLL_SECOND_MS) {
       ESP_LOGVV(TAG, "Sending second init poll");
@@ -405,6 +427,17 @@ void HoneywellGalaxy7Keypad::handle_reply_for_cmd_(const std::vector<uint8_t> &b
 
   // Activity poll: 11 FE BA => no key/tamper change
   if (this->last_cmd_ == CMD_ACTIVITY_19 && type == 0xFE && bytes.size() >= 3 && bytes[2] == 0xBA) {
+    return;
+  }
+
+  if (this->last_cmd_ == CMD_SCREEN_07 && type == 0xF2) {
+    ESP_LOGW(TAG, "Keypad rejected frame (F2), scheduling re-init: %s", bytes_to_hex(bytes).c_str());
+
+    // Drop any in-flight ACK idea for this key; keypad will re-send F4 if it still cares
+    this->needs_button_ack_      = false;
+
+    // Next loop when idle: send a fresh 00 poll and reset the flip-flops
+    this->need_reinit_after_f2_ = true;
     return;
   }
 
