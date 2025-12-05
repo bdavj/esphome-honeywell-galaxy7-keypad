@@ -48,6 +48,7 @@ class HoneywellGalaxy7Keypad : public uart::UARTDevice, public Component {
   void handle_keypress_(const std::string &key_name, bool tamper);
   std::pair<std::string, bool> decode_key_and_tamper_(uint8_t code);
   void update_tamper_state_(bool new_tamper, const std::string &context);
+  std::vector<uint8_t> build_screen_frame_();
   void bump_backlight_(const char *reason);
 
   std::string display_text_{"ESP-HOME|Initializing"};
@@ -66,8 +67,8 @@ class HoneywellGalaxy7Keypad : public uart::UARTDevice, public Component {
   bool awaiting_reply_{false};
   LastCmd last_cmd_{CMD_NONE};
   bool sent_second_init_{false};
+  bool needs_button_ack_{false};
   bool screen_dirty_{true};
-  bool needs_status_before_screen_{false};
   bool beep_set_{false};
   bool backlight_on_{false};
   bool backlight_cmd_pending_{false};
@@ -78,11 +79,13 @@ class HoneywellGalaxy7Keypad : public uart::UARTDevice, public Component {
   bool last_key_tamper_{false};
 
   uint32_t backlight_timeout_ms_{15000};
-  uint8_t ack_toggle_{0};
+  uint8_t ack_toggle_{0x02};  
   uint8_t device_id_{0x20};
   uint8_t beep_mode_{0x00};
   uint8_t beep_period_{0x00};
   uint8_t beep_quiet_period_{0x00};
+  uint8_t screen_seq_flag_{0x00};
+
 
   std::vector<uint8_t> rx_buf_;
 };

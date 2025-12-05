@@ -16,7 +16,7 @@ constexpr uint32_t INIT_POLL_INTERVAL_MS     = 5000;
 constexpr uint32_t SCREEN_PUSH_INTERVAL_MS   = 25000;
 constexpr uint32_t ACTIVITY_POLL_INTERVAL_MS = 150;
 constexpr uint32_t REPLY_WAIT_MS             = 100;
-constexpr uint32_t KEY_DEDUPE_WINDOW_MS      = 700;  // treat repeats within 0.7s as duplicate
+constexpr uint32_t KEY_DEDUPE_WINDOW_MS      = 100;  // treat repeats within 0.7s as duplicate
 
 // Convert a vector of bytes to "AA BB CC" string for logging.
 static std::string bytes_to_hex(const std::vector<uint8_t> &data) {
@@ -98,6 +98,54 @@ void HoneywellGalaxy7Keypad::bump_backlight_(const char *reason) {
   }
 }
 
+std::vector<uint8_t> HoneywellGalaxy7Keypad::build_screen_frame_() {
+  // Base flags from examples
+  uint8_t modifier = 0x01;
+
+  // Screen sequence bit (0x80) – flip *every* new screen
+  this->screen_seq_flag_ = (this->screen_seq_flag_ == 0x00) ? 0x80 : 0x00;
+  modifier |= this->screen_seq_flag_;
+
+  // If this screen is also acknowledging a keypress
+  if (this->needs_button_ack_) {
+    modifier |= 0x10;              // "this screen acks a key"
+    modifier |= this->ack_toggle_; // 0x00 or 0x02
+
+    ESP_LOGVV(TAG, "Building screen frame with button ACK: flags=%02X", modifier);
+
+    // Prepare next ack value
+    this->ack_toggle_ = (this->ack_toggle_ == 0x00) ? 0x02 : 0x00;
+    this->needs_button_ack_ = false;
+  }
+
+  std::vector<uint8_t> frame = {this->device_id_, 0x07, modifier, 0x17};
+
+  std::string line2 = this->input_buffer_.empty()
+                          ? this->display_line2_
+                          : std::string(std::min<size_t>(this->input_buffer_.size(), 16), '*');
+
+  std::string line1 = this->display_line1_;
+
+  // Make sure both lines are exactly 16 chars (pad with spaces)
+  if (line1.size() > 16) line1.resize(16);
+  else line1.resize(16, ' ');
+
+  if (line2.size() > 16) line2.resize(16);
+  else line2.resize(16, ' ');
+
+  // 0x17 reset already set cursor to 0x00, so write top line
+  frame.insert(frame.end(), line1.begin(), line1.end());
+
+  // Move cursor to bottom line, write it
+  frame.push_back(0x02);  // cursor -> 0x40
+  frame.insert(frame.end(), line2.begin(), line2.end());
+
+  // Hide cursor
+  frame.push_back(0x07);
+
+  return frame;
+}
+
 void HoneywellGalaxy7Keypad::setup() {
   ESP_LOGI(TAG, "Honeywell Galaxy keypad setup starting");
 
@@ -133,19 +181,23 @@ void HoneywellGalaxy7Keypad::loop() {
       ESP_LOGVV(TAG, "Sending second init poll");
       cmd_to_send = CMD_POLL_00;
     }
+
+    // d) screen update ASAP when dirty
+    else if (this->sent_second_init_ && this->screen_dirty_) {
+      ESP_LOGV(TAG, "Sending screen update");
+      cmd_to_send = CMD_SCREEN_07;
+    }
+
     // b) periodic 00 0F every 5s (or before screen retries)
-    else if ((now - this->last_init_poll_) >= INIT_POLL_INTERVAL_MS || this->needs_status_before_screen_) {
+    else if ((now - this->last_init_poll_) >= INIT_POLL_INTERVAL_MS) {
       cmd_to_send = CMD_POLL_00;
+      this->ack_toggle_ = 0x02;  // reset ACK toggle on new poll
+      this->screen_seq_flag_ = 0x00; // reset screen seq on new poll
     }
     // c) one-time beep disable once init is done
     else if (this->sent_second_init_ && !this->beep_set_) {
       cmd_to_send = CMD_BEEP_0C;
     }
-    // d) screen update ASAP when dirty (currently disabled while we stabilise)
-     else if (this->sent_second_init_ && this->screen_dirty_ && !this->needs_status_before_screen_) {
-       ESP_LOGV(TAG, "Sending screen update");
-       cmd_to_send = CMD_SCREEN_07;
-     }
 
     // e) backlight command if pending
     else if (this->backlight_cmd_pending_) {
@@ -171,29 +223,11 @@ void HoneywellGalaxy7Keypad::loop() {
           break;
 
         case CMD_SCREEN_07: {
-          // Build screen frame: {ID, 0x07, 0xA1, 0x17} + line1 + 0x02 + line2 + 0x07
-          std::vector<uint8_t> screen = {this->device_id_, 0x07, 0xA1, 0x17};
-          std::string line2 = this->input_buffer_.empty()
-                                  ? this->display_line2_
-                                  : std::string(std::min<size_t>(this->input_buffer_.size(), 16), '*');
-
-          std::string line1 = this->display_line1_;
-          if (line1.size() > 16) line1.resize(16);
-          if (line2.size() > 16) line2.resize(16);
-
-          screen.insert(screen.end(), line1.begin(), line1.end());
-          screen.push_back(0x02);
-          screen.insert(screen.end(), line2.begin(), line2.end());
-          screen.push_back(0x07);
-
-          ESP_LOGD(TAG, "Sending screen frame (%d bytes): %s",
-                   (int) (screen.size() + 1),
-                   bytes_to_hex(screen).c_str());
+          std::vector<uint8_t> screen = this->build_screen_frame_();
 
           this->send_frame(screen);
           this->last_screen_push_ = now;
           this->screen_dirty_ = false;
-          this->needs_status_before_screen_ = true;
           this->bump_backlight_("screen push");
           break;
         }
@@ -248,6 +282,13 @@ void HoneywellGalaxy7Keypad::loop() {
   if (this->backlight_on_ && now >= this->backlight_off_at_) {
     this->backlight_target_on_ = false;
     this->backlight_cmd_pending_ = true;
+
+    //Clear * in buffer and refresh screen
+    if (!this->input_buffer_.empty()) {
+      this->input_buffer_.clear();
+      this->screen_dirty_ = true;
+      ESP_LOGI(TAG, "Backlight timeout cleared input buffer");
+    }
   }
 }
 
@@ -324,6 +365,7 @@ void HoneywellGalaxy7Keypad::handle_keypress_(const std::string &key_name, bool 
       this->screen_dirty_ = true;
       ESP_LOGI(TAG, "Keypad input cleared (ESC)");
     }
+    this->screen_dirty_ = true;
     return;
   }
 
@@ -339,6 +381,7 @@ void HoneywellGalaxy7Keypad::handle_keypress_(const std::string &key_name, bool 
       }
     } else {
       ESP_LOGI(TAG, "ENT pressed with no buffered digits");
+      this->screen_dirty_ = true;  // force a screen push to carry the ACK
     }
     return;
   }
@@ -359,12 +402,6 @@ void HoneywellGalaxy7Keypad::handle_reply_for_cmd_(const std::vector<uint8_t> &b
     return;
 
   uint8_t type = (bytes.size() >= 2) ? bytes[1] : 0x00;
-
-  // Status / 00 polls
-  if (this->last_cmd_ == CMD_POLL_00) {
-    this->needs_status_before_screen_ = false;
-    return;
-  }
 
   // Activity poll: 11 FE BA => no key/tamper change
   if (this->last_cmd_ == CMD_ACTIVITY_19 && type == 0xFE && bytes.size() >= 3 && bytes[2] == 0xBA) {
@@ -391,7 +428,7 @@ void HoneywellGalaxy7Keypad::handle_reply_for_cmd_(const std::vector<uint8_t> &b
     return;
   }
 
-  // --- F4 shared handler ---
+   // --- F4 shared handler ---
   if (type == 0xF4 && bytes.size() == 4) {
     uint8_t code = bytes[2];
     uint8_t cs   = bytes[3];
@@ -410,10 +447,11 @@ void HoneywellGalaxy7Keypad::handle_reply_for_cmd_(const std::vector<uint8_t> &b
 
     this->update_tamper_state_(tamper, "From F4");
 
-    // --- SCREEN context: ACK + optional tamper, but NO 0B here ---
+    // --- SCREEN context: screen ACK / tamper after 07 ---
     if (this->last_cmd_ == CMD_SCREEN_07) {
       if (code == 0x7F) {
-        ESP_LOGI(TAG, "Screen ACK (tamper=%d): %s", tamper ? 1 : 0, bytes_to_hex(bytes).c_str());
+        ESP_LOGI(TAG, "Screen ACK (tamper=%d): %s",
+                 tamper ? 1 : 0, bytes_to_hex(bytes).c_str());
       } else {
         ESP_LOGV(TAG, "Screen reply key=%s%s %s",
                  key_name.c_str(),
@@ -423,7 +461,7 @@ void HoneywellGalaxy7Keypad::handle_reply_for_cmd_(const std::vector<uint8_t> &b
       return;
     }
 
-    // --- ACTIVITY poll context: real key events & 0B ACK live here ---
+    // --- F4 after ACTIVITY poll: keypress / tamper events ---
     if (this->last_cmd_ == CMD_ACTIVITY_19) {
       // Tamper-only (0x7F) – no key; track tamper, no ACK
       if (tamper_only) {
@@ -439,14 +477,14 @@ void HoneywellGalaxy7Keypad::handle_reply_for_cmd_(const std::vector<uint8_t> &b
 
       uint32_t now_ms = millis();
       bool duplicate = (key_name == this->last_key_name_) &&
-                       (tamper == this->last_key_tamper_) &&
-                       (now_ms - this->last_key_ts_ <= KEY_DEDUPE_WINDOW_MS);
+                      (tamper == this->last_key_tamper_) &&
+                      (now_ms - this->last_key_ts_ <= KEY_DEDUPE_WINDOW_MS);
 
       if (!duplicate) {
         ESP_LOGI(TAG, "Key=%s%s %s",
-                 key_name.c_str(),
-                 tamper ? " [TAMPER]" : "",
-                 bytes_to_hex(bytes).c_str());
+                key_name.c_str(),
+                tamper ? " [TAMPER]" : "",
+                bytes_to_hex(bytes).c_str());
 
         this->last_key_name_   = key_name;
         this->last_key_tamper_ = tamper;
@@ -456,20 +494,19 @@ void HoneywellGalaxy7Keypad::handle_reply_for_cmd_(const std::vector<uint8_t> &b
         this->handle_keypress_(key_name, tamper);
       } else {
         ESP_LOGV(TAG, "Duplicate key=%s%s ignored",
-                 key_name.c_str(),
-                 tamper ? " [TAMPER]" : "");
+                key_name.c_str(),
+                tamper ? " [TAMPER]" : "");
       }
 
-      // Always ACK back to keypad for any F4 in ACTIVITY context
-      ESP_LOGV(TAG, "Sending ACK to keypad: 20 0B %02X", this->ack_toggle_);
-      this->send_frame({this->device_id_, 0x0B, this->ack_toggle_});
-      this->ack_toggle_ = (this->ack_toggle_ == 0x00) ? 0x02 : 0x00;
+      // Always schedule a screen ACK for any key F4 (even duplicates),
+      // so the keypad sees an acknowledgement and stops repeating.
+      this->needs_button_ack_ = true;
+      this->screen_dirty_     = true;   // <-- NEW: force a 07 to carry the ACK
 
       return;
     }
 
     // --- F4 after other commands (00 poll, beep, backlight, etc.) ---
-    // Only interesting for tamper tracking; NO 0B ACK here.
     if (tamper_only) {
       ESP_LOGV(TAG, "F4 OTHER tamper-only after cmd=%d: %s",
                this->last_cmd_,
