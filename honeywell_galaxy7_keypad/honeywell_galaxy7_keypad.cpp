@@ -60,6 +60,18 @@ void HoneywellGalaxy7Keypad::set_display_text(const std::string &text) {
   ESP_LOGD(TAG, "Display text set to: %s", this->display_text_.c_str());
 }
 
+void HoneywellGalaxy7Keypad::set_display_text_nobl(const std::string &text) {
+  if (text.empty()) {
+    this->display_text_ = "ESP-HOME|Initializing";
+  } else {
+    this->display_text_ = text;
+  }
+  this->parse_display_text_();
+  this->screen_dirty_ = true;
+  ESP_LOGD(TAG, "Display text set to: %s", this->display_text_.c_str());
+}
+
+
 void HoneywellGalaxy7Keypad::set_beep_enabled(bool enabled, uint8_t beep_period, uint8_t quiet_period) {
   this->beep_mode_ = enabled ? 0x01 : 0x00;
   this->beep_period_ = beep_period;
@@ -400,6 +412,13 @@ void HoneywellGalaxy7Keypad::handle_keypress_(const std::string &key_name, bool 
       ESP_LOGI(TAG, "Code entered: %s", code.c_str());
       if (this->rx_sens_ != nullptr) {
         this->rx_sens_->publish_state(code);
+
+      // Clear it shortly after so the next identical code still fires
+      this->set_timeout("clear_rx_sens", 200, [this]() {
+        if (this->rx_sens_ != nullptr) {
+          this->rx_sens_->publish_state("");
+        }
+      });
       }
     } else {
       ESP_LOGI(TAG, "ENT pressed with no buffered digits");
@@ -430,22 +449,21 @@ void HoneywellGalaxy7Keypad::handle_reply_for_cmd_(const std::vector<uint8_t> &b
     return;
   }
 
-  if (this->last_cmd_ == CMD_SCREEN_07 && type == 0xF2) {
-    ESP_LOGW(TAG, "Keypad rejected frame (F2), scheduling re-init: %s", bytes_to_hex(bytes).c_str());
+// Screen write: F2 => bad frame, we still owe an ACK for the same key.
+// Re-init the protocol state, then resend a clean 07 with the same ACK flags.
+if (this->last_cmd_ == CMD_SCREEN_07 && type == 0xF2) {
+  ESP_LOGW(TAG, "Keypad rejected frame (F2), scheduling re-init: %s",
+           bytes_to_hex(bytes).c_str());
 
-    // Drop any in-flight ACK idea for this key; keypad will re-send F4 if it still cares
-    this->needs_button_ack_      = false;
+  // Do NOT clear key_ack_pending_ / ack_pending_code_ here:
+  // keypad still thinks that key is un-acked.
+  // We just force a re-init and another 07 to carry that ACK.
+  this->need_reinit_after_f2_ = true;
+  this->screen_dirty_         = true;  // resend the same logical screen
 
-    // Next loop when idle: send a fresh 00 poll and reset the flip-flops
-    this->need_reinit_after_f2_ = true;
-    return;
-  }
+  return;
+}
 
-  // Screen write: F2 => bad frame
-  if (this->last_cmd_ == CMD_SCREEN_07 && type == 0xF2) {
-    ESP_LOGW(TAG, "Keypad rejected frame (F2): %s", bytes_to_hex(bytes).c_str());
-    return;
-  }
 
   // Screen write: FE BA => busy/OK
   if (this->last_cmd_ == CMD_SCREEN_07 && type == 0xFE && bytes.size() >= 3 && bytes[2] == 0xBA) {
@@ -481,18 +499,23 @@ void HoneywellGalaxy7Keypad::handle_reply_for_cmd_(const std::vector<uint8_t> &b
     this->update_tamper_state_(tamper, "From F4");
 
     // --- SCREEN context: screen ACK / tamper after 07 ---
-    if (this->last_cmd_ == CMD_SCREEN_07) {
-      if (code == 0x7F) {
-        ESP_LOGI(TAG, "Screen ACK (tamper=%d): %s",
-                 tamper ? 1 : 0, bytes_to_hex(bytes).c_str());
-      } else {
-        ESP_LOGV(TAG, "Screen reply key=%s%s %s",
-                 key_name.c_str(),
-                 tamper ? " [TAMPER]" : "",
-                 bytes_to_hex(bytes).c_str());
-      }
-      return;
-    }
+if (this->last_cmd_ == CMD_SCREEN_07) {
+  if (code == 0x7F) {
+    ESP_LOGI(TAG, "Screen ACK (tamper=%d): %s",
+             tamper ? 1 : 0, bytes_to_hex(bytes).c_str());
+
+    // We finally got confirmation that our ACKed key has been seen.
+    this->key_ack_pending_  = false;
+    this->ack_pending_code_ = 0x00;
+  } else {
+    ESP_LOGV(TAG, "Screen reply key=%s%s %s",
+             key_name.c_str(),
+             tamper ? " [TAMPER]" : "",
+             bytes_to_hex(bytes).c_str());
+  }
+  return;
+}
+
 
     // --- F4 after ACTIVITY poll: keypress / tamper events ---
     if (this->last_cmd_ == CMD_ACTIVITY_19) {
@@ -509,11 +532,15 @@ void HoneywellGalaxy7Keypad::handle_reply_for_cmd_(const std::vector<uint8_t> &b
       }
 
       uint32_t now_ms = millis();
-      bool duplicate = (key_name == this->last_key_name_) &&
-                      (tamper == this->last_key_tamper_) &&
-                      (now_ms - this->last_key_ts_ <= KEY_DEDUPE_WINDOW_MS);
+      bool duplicate_time = (key_name == this->last_key_name_) &&
+                            (tamper == this->last_key_tamper_) &&
+                            (now_ms - this->last_key_ts_ <= KEY_DEDUPE_WINDOW_MS);
 
-      if (!duplicate) {
+      // NEW: duplicate because keypad is re-sending the same key while
+      // we're still waiting for an ACK to land.
+      bool duplicate_ack = this->key_ack_pending_ && (code == this->ack_pending_code_);
+
+      if (!duplicate_time && !duplicate_ack) {
         ESP_LOGI(TAG, "Key=%s%s %s",
                 key_name.c_str(),
                 tamper ? " [TAMPER]" : "",
@@ -526,18 +553,24 @@ void HoneywellGalaxy7Keypad::handle_reply_for_cmd_(const std::vector<uint8_t> &b
         // Only treat non-duplicates as "real" keypresses
         this->handle_keypress_(key_name, tamper);
       } else {
-        ESP_LOGV(TAG, "Duplicate key=%s%s ignored",
+        ESP_LOGV(TAG, "Duplicate key=%s%s (time_dup=%d, ack_dup=%d) ignored %s",
                 key_name.c_str(),
-                tamper ? " [TAMPER]" : "");
+                tamper ? " [TAMPER]" : "",
+                duplicate_time ? 1 : 0,
+                duplicate_ack ? 1 : 0,
+                bytes_to_hex(bytes).c_str());
       }
 
-      // Always schedule a screen ACK for any key F4 (even duplicates),
-      // so the keypad sees an acknowledgement and stops repeating.
-      this->needs_button_ack_ = true;
-      this->screen_dirty_     = true;   // <-- NEW: force a 07 to carry the ACK
+      // Always schedule a screen ACK for any F4 key event (even if duplicate),
+      // so the keypad eventually sees an acknowledgement and stops repeating.
+      this->needs_button_ack_  = true;
+      this->screen_dirty_      = true;
+      this->key_ack_pending_   = true;
+      this->ack_pending_code_  = code;
 
       return;
     }
+
 
     // --- F4 after other commands (00 poll, beep, backlight, etc.) ---
     if (tamper_only) {

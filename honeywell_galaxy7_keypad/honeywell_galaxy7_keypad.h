@@ -32,10 +32,15 @@ class HoneywellGalaxy7Keypad : public uart::UARTDevice, public Component {
   // API service: write data to RS485
   void api_write_rs485(const std::string &data);
   void set_display_text(const std::string &text);
+  void set_display_text_nobl(const std::string &text);
 
   // Optional controls exposed to automations
   void set_backlight_timeout(uint32_t timeout_ms) { this->backlight_timeout_ms_ = timeout_ms; }
   void set_beep_enabled(bool enabled, uint8_t beep_period = 0x00, uint8_t quiet_period = 0x00);
+
+  // Call this whenever we successfully parse a frame from the panel
+  void on_panel_frame_received_(const std::vector<uint8_t> &frame);
+
 
   // Optional RX text sensor hook
   void set_rx_text_sensor(text_sensor::TextSensor *sens) { this->rx_sens_ = sens; }
@@ -91,6 +96,9 @@ class HoneywellGalaxy7Keypad : public uart::UARTDevice, public Component {
   uint8_t ack_pending_code_{0x00};    // NEW: raw F4 code for that key
 
   std::vector<uint8_t> rx_buf_;
+
+  uint32_t last_panel_rx_ms_{0};
+  bool panel_online_{false};
 };
 
 }  // namespace honeywell_galaxy7_keypad
