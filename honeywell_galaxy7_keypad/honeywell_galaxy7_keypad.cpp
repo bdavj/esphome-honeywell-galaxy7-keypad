@@ -18,6 +18,9 @@ constexpr uint32_t ACTIVITY_POLL_INTERVAL_MS = 150;
 constexpr uint32_t REPLY_WAIT_MS             = 100;
 constexpr uint32_t KEY_DEDUPE_WINDOW_MS      = 100;  // treat repeats within 0.7s as duplicate
 
+static const uint32_t PANEL_OFFLINE_TIMEOUT_MS = 300;  // 10s – tweak as you like
+
+
 // Convert a vector of bytes to "AA BB CC" string for logging.
 static std::string bytes_to_hex(const std::vector<uint8_t> &data) {
   std::ostringstream oss;
@@ -184,6 +187,11 @@ void HoneywellGalaxy7Keypad::setup() {
 void HoneywellGalaxy7Keypad::loop() {
   uint32_t now = millis();
 
+  if (this->panel_online_ && (now - this->last_panel_rx_ms_ > PANEL_OFFLINE_TIMEOUT_MS)) {
+    this->panel_online_ = false;
+    ESP_LOGW(TAG, "Panel timeout, marking offline");
+  }
+
   // 1) If idle, choose exactly one thing to send (mirrors Python loop)
   if (!this->awaiting_reply_) {
     LastCmd cmd_to_send = CMD_NONE;
@@ -273,6 +281,8 @@ void HoneywellGalaxy7Keypad::loop() {
           break;
 
         case CMD_BEEP_0C:
+        ESP_LOGV(TAG, "Sending BEEP command: 0C %02X %02X %02X",
+                this->beep_mode_, this->beep_period_, this->beep_quiet_period_);
           this->send_frame({this->device_id_, 0x0C, this->beep_mode_, this->beep_period_, this->beep_quiet_period_});
           this->beep_set_ = true;
           break;
@@ -442,6 +452,18 @@ void HoneywellGalaxy7Keypad::handle_reply_for_cmd_(const std::vector<uint8_t> &b
   if (bytes.empty() || bytes[0] != KEYPAD_ADDR)
     return;
 
+  
+  uint32_t now = millis();
+  this->last_panel_rx_ms_ = now;
+
+  if (!this->panel_online_) {
+    this->panel_online_ = true;
+    ESP_LOGI(TAG, "Panel came online, sending init / clearing beep");
+    // This is where you do your “proper” init sequence:
+    beep_set_ = false;
+    screen_dirty_ = true;
+  }
+
   uint8_t type = (bytes.size() >= 2) ? bytes[1] : 0x00;
 
   // Activity poll: 11 FE BA => no key/tamper change
@@ -449,20 +471,20 @@ void HoneywellGalaxy7Keypad::handle_reply_for_cmd_(const std::vector<uint8_t> &b
     return;
   }
 
-// Screen write: F2 => bad frame, we still owe an ACK for the same key.
-// Re-init the protocol state, then resend a clean 07 with the same ACK flags.
-if (this->last_cmd_ == CMD_SCREEN_07 && type == 0xF2) {
-  ESP_LOGW(TAG, "Keypad rejected frame (F2), scheduling re-init: %s",
-           bytes_to_hex(bytes).c_str());
+  // Screen write: F2 => bad frame, we still owe an ACK for the same key.
+  // Re-init the protocol state, then resend a clean 07 with the same ACK flags.
+  if (this->last_cmd_ == CMD_SCREEN_07 && type == 0xF2) {
+    ESP_LOGW(TAG, "Keypad rejected frame (F2), scheduling re-init: %s",
+            bytes_to_hex(bytes).c_str());
 
-  // Do NOT clear key_ack_pending_ / ack_pending_code_ here:
-  // keypad still thinks that key is un-acked.
-  // We just force a re-init and another 07 to carry that ACK.
-  this->need_reinit_after_f2_ = true;
-  this->screen_dirty_         = true;  // resend the same logical screen
+    // Do NOT clear key_ack_pending_ / ack_pending_code_ here:
+    // keypad still thinks that key is un-acked.
+    // We just force a re-init and another 07 to carry that ACK.
+    this->need_reinit_after_f2_ = true;
+    this->screen_dirty_         = true;  // resend the same logical screen
 
-  return;
-}
+    return;
+  }
 
 
   // Screen write: FE BA => busy/OK

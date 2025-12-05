@@ -40,7 +40,7 @@ class HoneywellGalaxy7Keypad : public uart::UARTDevice, public Component {
 
   // Call this whenever we successfully parse a frame from the panel
   void on_panel_frame_received_(const std::vector<uint8_t> &frame);
-
+  bool is_panel_online() const { return this->panel_online_; }
 
   // Optional RX text sensor hook
   void set_rx_text_sensor(text_sensor::TextSensor *sens) { this->rx_sens_ = sens; }
