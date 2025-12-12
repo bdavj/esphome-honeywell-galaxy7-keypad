@@ -14,14 +14,14 @@ Copy the `honeywell_galaxy7_keypad` folder into your ESPHome `custom_components`
 
 ```yaml
 external_components:
-  - source: github://<your-username>/esphome-honeywell-galaxy7-keypad@main
+  - source: github://bdavj/esphome-honeywell-galaxy7-keypad@main
     components: [honeywell_galaxy7_keypad]
 ```
 
 ## Hardware
 
 - ESP32/ESP8266 with a 3.3V RS485 transceiver (e.g., MAX3485/75176).
-- Wire UART TX/RX to the transceiver DI/RO pins, tie DE/RE together and drive from a GPIO (or tie high for always-on if you share the bus carefully).
+- Wire RS485 A/B lines to keypad
 - Bus runs at 9600 baud, 8-N-1.
 
 ## Basic configuration
@@ -41,73 +41,37 @@ uart:
 
 text_sensor:
   - platform: template
-    id: rs485_rx
-    name: "RS485 RX"
+    id: galaxy_entered_code
+    name: "Galaxy keypad entry"
 
 honeywell_galaxy7_keypad:
-  id: honeywell_galaxy7_keypad_1
-  uart_id: rs485_bus
-  rs485_rx_id: rs485_rx                     # Publishes buffered digits when ENT is pressed
-  screen_number: 2                          # 1–4 -> keypad IDs 0x10/0x20/0x30/0x40 (default: 2)
-  display_text: "ESP-HOME|Initializing"     # Two lines split by '|'
-  backlight_timeout: 15s                    # How long to keep the backlight on after activity
+  id: kp_hall
+  bus_id: galaxy_bus
+  screen_number: 1         # or address: 0x10
+  display_text: "Test|poodle"
+  backlight_timeout: 15s
 
-# Enable Home Assistant API and expose services to set the display
+  code:
+    name: "Galaxy Keypad Code"
+
+  tamper:
+    name: "Galaxy Keypad Tamper"
+
+  beep_switch:
+    name: "Galaxy Keypad Beep"
+
+  panel_online:
+    name: "Galaxy Panel Online"
+
 api:
-  encryption:
-    key: "Key"
   services:
     - service: set_galaxy_keypad_text
       variables:
         msg: string
       then:
-        - lambda: |-
-            id(honeywell_galaxy7_keypad_1).set_display_text(msg);
-    - service: set_galaxy_keypad_text_no_backlight
-      variables:
-        msg: string
-      then:
-        - lambda: |-
-            id(honeywell_galaxy7_keypad_1).set_display_text_nobl(msg);
+        - lambda: 'id(galaxy_keypad).set_display_text(msg);'
 
-# Optional: toggle keypad beep from HA
-switch:
-  - platform: template
-    id: galaxy_keypad_beep
-    name: "Galaxy Keypad Beep"
-    lambda: |-
-      return id(galaxy_beep_enabled);  // report current state
-    turn_on_action:
-      - lambda: |-
-          id(galaxy_beep_enabled) = true;
-          id(honeywell_galaxy7_keypad_1).set_beep_enabled(true, 8, 4);
-    turn_off_action:
-      - lambda: |-
-          id(galaxy_beep_enabled) = false;
-          id(honeywell_galaxy7_keypad_1).set_beep_enabled(false, 8, 4);
-
-binary_sensor:
-  - platform: status
-    name: "Galaxy Keypad ESP Status"
-    id: galaxy_keypad_status
-  - platform: template
-    name: "Galaxy Panel Online"
-    id: galaxy_panel_online
-    lambda: |-
-      auto *kp = id(honeywell_galaxy7_keypad_1);
-      if (!kp) return {};
-      return kp->is_panel_online();
-
-button:
-  - platform: template
-    name: "Keypad Refresh"
-    on_press:
-      - lambda: 'id(honeywell_galaxy7_keypad_1).set_display_text("Ready|System");'
 ```
-
-- Beep switch toggles `set_beep_enabled()` and returns the cached `galaxy_beep_enabled` state (add a `globals:` entry if you want it persisted).
-- `Galaxy Panel Online` mirrors `is_panel_online()` so you can drive HA cards/automations.
-- `Keypad Refresh` gives you a one-tap way to push a known screen.
 
 ### Updating the display from Home Assistant
 
