@@ -1,0 +1,124 @@
+esphome:
+  name: waveshare-rs485
+  friendly_name: waveshare-rs485
+  platformio_options:
+    build_flags:
+      - "-std=gnu++2a"
+    build_unflags:
+      - "-std=gnu++11"
+      - "-fno-rtti"
+
+esp32:
+  board: esp32s3_120_16_8-qio_opi
+  framework:
+    type: esp-idf
+
+
+globals:
+  - id: galaxy_beep_enabled
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+# Enable Home Assistant API
+api:
+  encryption:
+    key: "SxyIeyNceKSONUbNP7g0eTBCGobGA1rRLj6EC8A/1Gc="
+  services:
+    - service: set_galaxy_keypad_text
+      variables:
+        msg: string
+      then:
+        - lambda: |-
+            id(honeywell_galaxy7_keypad_1).set_display_text(msg);
+    - service: set_galaxy_keypad_text_no_backlight
+      variables:
+        msg: string
+      then:
+        - lambda: |-
+            id(honeywell_galaxy7_keypad_1).set_display_text_nobl(msg);
+
+
+switch:
+  - platform: template
+    id: galaxy_keypad_beep
+    name: "Galaxy Keypad Beep"
+    lambda: |-
+      // Report the current state to HA
+      return id(galaxy_beep_enabled);
+
+    turn_on_action:
+      - lambda: |-
+          id(galaxy_beep_enabled) = true;
+          // enable and set a clear beep pattern (adjust if you want)
+          id(honeywell_galaxy7_keypad_1).set_beep_enabled(true, 8, 4);
+
+    turn_off_action:
+      - lambda: |-
+          id(galaxy_beep_enabled) = false;
+          id(honeywell_galaxy7_keypad_1).set_beep_enabled(false, 8, 4);
+
+binary_sensor:
+  - platform: status
+    name: "Galaxy Keypad ESP Status"
+    id: galaxy_keypad_status
+  - platform: template
+    name: "Galaxy Panel Online"
+    id: galaxy_panel_online
+    lambda: |-
+      auto *kp = id(honeywell_galaxy7_keypad_1);
+      if (!kp) return {};
+      return kp->is_panel_online();
+
+
+button:
+  - platform: template
+    name: "Keypad Refresh"
+    on_press:
+      - lambda: 'id(honeywell_galaxy7_keypad_1).set_display_text("Ready|System");'
+
+
+
+ota:
+  - platform: esphome
+    password: "d80b85e0204e7d1a21fe1b1130e74a5a"
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+captive_portal:
+
+
+external_components:
+  - source:
+      type: local
+      path: custom-components
+
+
+
+text_sensor:
+  - platform: template
+    id: rs485_rx
+    name: "RS485 RX"
+
+honeywell_galaxy7_keypad:
+  id: honeywell_galaxy7_keypad_1
+  uart_id: rs485_bus
+  rs485_rx_id: rs485_rx
+
+
+logger:
+  level: DEBUG
+  baud_rate: 0        # keep logs on USB, not on UART
+
+uart:
+  id: rs485_bus
+  tx_pin: GPIO17
+  rx_pin: GPIO18
+  baud_rate: 9600
+  parity: NONE
+  stop_bits: 1
+  flow_control_pin: GPIO21    # <– TXD1EN
+
+#5
