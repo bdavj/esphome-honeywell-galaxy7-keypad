@@ -1,6 +1,6 @@
 import esphome.codegen as cg
 import esphome.config_validation as cv
-from esphome.components import text_sensor, binary_sensor, switch
+from esphome.components import text_sensor, binary_sensor, switch, sensor
 from esphome.const import CONF_ID
 
 from ..galaxybus import GalaxyBus
@@ -8,6 +8,7 @@ from ..galaxybus import GalaxyBus
 CONF_SCREEN_NUMBER = "screen_number"
 CONF_DISPLAY_TEXT = "display_text"
 CONF_BACKLIGHT_TIMEOUT = "backlight_timeout"
+CONF_PROX_POLL = "prox_poll"
 
 CONF_BUS_ID = "bus_id"
 CONF_ADDRESS = "address"
@@ -15,11 +16,12 @@ CONF_ADDRESS = "address"
 CONF_CODE = "code_sensor"
 CONF_RX_TEXT_SENSOR = "rx_text_sensor"
 CONF_TAMPER = "tamper_sensor"
+CONF_PAGE_SENSOR = "page_sensor"
 CONF_BEEP_SWITCH = "beep_switch"
 CONF_PANEL_ONLINE = "panel_online_sensor"
 
 DEPENDENCIES = ["galaxybus"]
-AUTO_LOAD = ["text_sensor", "binary_sensor", "switch"]
+AUTO_LOAD = ["text_sensor", "binary_sensor", "switch", "sensor"]
 
 ns = cg.esphome_ns.namespace("honeywell_galaxy7_keypad")
 galaxybus_ns = cg.esphome_ns.namespace("galaxybus")
@@ -49,6 +51,7 @@ CONFIG_SCHEMA = (
                 CONF_BACKLIGHT_TIMEOUT,
                 default="15s",
             ): cv.positive_time_period_milliseconds,
+            cv.Optional(CONF_PROX_POLL, default=False): cv.boolean,
 
             # Proper declarative entities
             cv.Optional(CONF_CODE): text_sensor.text_sensor_schema(),
@@ -56,6 +59,11 @@ CONFIG_SCHEMA = (
             cv.Optional(CONF_TAMPER): binary_sensor.binary_sensor_schema(),
             cv.Optional(CONF_BEEP_SWITCH): switch.switch_schema(BeepSwitch),
             cv.Optional(CONF_PANEL_ONLINE): binary_sensor.binary_sensor_schema(),
+            cv.Optional(CONF_PAGE_SENSOR): sensor.sensor_schema(
+                unit_of_measurement="",
+                icon="mdi:page-next",
+                accuracy_decimals=0,
+            ),
         }
     ).extend(cv.COMPONENT_SCHEMA)
 )
@@ -80,6 +88,7 @@ async def to_code(config):
 
     cg.add(var.set_display_text(config[CONF_DISPLAY_TEXT]))
     cg.add(var.set_backlight_timeout(config[CONF_BACKLIGHT_TIMEOUT]))
+    cg.add(var.enable_prox_polling(config[CONF_PROX_POLL]))
 
     # Code text sensor (publishes entered code on ENT)
     if CONF_CODE in config:
@@ -95,6 +104,11 @@ async def to_code(config):
     if CONF_TAMPER in config:
         tamper_sens = await binary_sensor.new_binary_sensor(config[CONF_TAMPER])
         cg.add(var.set_tamper_binary_sensor(tamper_sens))
+
+    # Page number
+    if CONF_PAGE_SENSOR in config:
+        page_sens = await sensor.new_sensor(config[CONF_PAGE_SENSOR])
+        cg.add(var.set_page_sensor(page_sens))
 
     # Beep control switch
     if CONF_BEEP_SWITCH in config:

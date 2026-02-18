@@ -19,8 +19,10 @@ constexpr uint32_t INIT_POLL_SECOND_MS       = 5000;
 constexpr uint32_t INIT_POLL_INTERVAL_MS     = 5000;
 constexpr uint32_t SCREEN_PUSH_INTERVAL_MS   = 25000;  // unused but kept
 constexpr uint32_t ACTIVITY_POLL_INTERVAL_MS = 150;
+constexpr uint32_t PROX_POLL_INTERVAL_MS     = 150;
 constexpr uint32_t KEY_DEDUPE_WINDOW_MS      = 100;
 constexpr uint32_t PANEL_OFFLINE_TIMEOUT_MS  = 300;    // ms
+constexpr uint32_t PROX_DEBOUNCE_MS          = 2000;   // ms
 
 // Convert a vector of bytes to "AA BB CC" string for logging.
 static std::string bytes_to_hex(const std::vector<uint8_t> &data) {
@@ -92,6 +94,13 @@ void HoneywellGalaxy7Keypad::set_beep_enabled(bool enabled, uint8_t beep_period,
   this->beep_quiet_period_ = quiet_period;
   this->beep_set_ = false;  // re-run 0C on next idle
   this->sync_beep_switch_state_();
+}
+
+uint8_t HoneywellGalaxy7Keypad::compute_prox_id_() const {
+  // Map keypad address (0x10/0x20/0x30/0x40) to prox address (0x90/0x91/0x92/0x93).
+  // Use the upper nibble as the screen index (1-4) and offset from 0x90.
+  uint8_t screen_index = (this->device_id_ >> 4) & 0x0F;  // 1..4
+  return static_cast<uint8_t>(0x90 + (screen_index - 1));
 }
 
 void HoneywellGalaxy7Keypad::parse_display_text_() {
@@ -172,9 +181,14 @@ void HoneywellGalaxy7Keypad::setup() {
   uint32_t now = millis();
   this->last_init_poll_ = now;
   this->last_activity_poll_ = now;
+  this->last_prox_poll_ = now;
 
   // Kick first poll (00/0E)
   this->send_frame({this->device_id_, 0x00, 0x0E}, CMD_POLL_00);
+
+  //set initial page
+  this->page_index_ = 0;
+  this->publish_page_();
 
   ESP_LOGI(TAG, "Honeywell Galaxy keypad setup STARTED");
 }
@@ -225,9 +239,17 @@ void HoneywellGalaxy7Keypad::loop() {
     else if (this->backlight_cmd_pending_) {
       cmd_to_send = CMD_BACKLIGHT_0D;
     }
+    // pending one-shot beep (e.g., prox tag)
+    else if (this->pending_prox_beep_) {
+      cmd_to_send = CMD_BEEP_ONESHOT;
+    }
     // activity poll
     else if ((now - this->last_activity_poll_) >= ACTIVITY_POLL_INTERVAL_MS) {
       cmd_to_send = CMD_ACTIVITY_19;
+    }
+    // prox poll (optional)
+    else if (this->prox_enabled_ && (now - this->last_prox_poll_) >= PROX_POLL_INTERVAL_MS) {
+      cmd_to_send = CMD_PROX_POLL;
     }
 
     if (cmd_to_send != CMD_NONE) {
@@ -251,6 +273,11 @@ void HoneywellGalaxy7Keypad::loop() {
           this->last_activity_poll_ = now;
           this->send_frame({this->device_id_, 0x19, 0x01}, CMD_ACTIVITY_19);
           break;
+        case CMD_PROX_POLL: {
+          this->last_prox_poll_ = now;
+          this->send_frame({this->prox_id_, 0x07, 0x02}, CMD_PROX_POLL);
+          break;
+        }
 
         case CMD_BEEP_0C:
           ESP_LOGV(TAG, "Sending BEEP command: 0C %02X %02X %02X",
@@ -260,6 +287,13 @@ void HoneywellGalaxy7Keypad::loop() {
               CMD_BEEP_0C);
           this->beep_set_ = true;
           break;
+        case CMD_BEEP_ONESHOT: {
+          this->pending_prox_beep_ = false;
+          ESP_LOGV(TAG, "Sending one-shot PROX beep");
+          this->send_frame({this->device_id_, 0x0C, 0x01, 0x01, 0x00}, CMD_BEEP_ONESHOT);
+          this->beep_set_ = false;  // ensure stored beep config is resent after the one-shot
+          break;
+        }
 
         case CMD_BACKLIGHT_0D: {
           uint8_t val = this->backlight_target_on_ ? 0x01 : 0x00;
@@ -279,11 +313,24 @@ void HoneywellGalaxy7Keypad::loop() {
   if (this->backlight_on_ && now >= this->backlight_off_at_) {
     this->backlight_target_on_ = false;
     this->backlight_cmd_pending_ = true;
+    bool changed = false;
+
 
     if (!this->input_buffer_.empty()) {
       this->input_buffer_.clear();
-      this->screen_dirty_ = true;
+      changed = true;
       ESP_LOGI(TAG, "Backlight timeout cleared input buffer");
+    }
+
+    if (this->page_index_ != 0) {
+      this->page_index_ = 0;
+      this->publish_page_();
+      changed = true;
+      ESP_LOGI(TAG, "Backlight timeout reset page to 0");
+    }
+
+    if (changed) {
+      this->screen_dirty_ = true;
     }
   }
 }
@@ -291,6 +338,7 @@ void HoneywellGalaxy7Keypad::loop() {
 void HoneywellGalaxy7Keypad::dump_config() {
   ESP_LOGCONFIG(TAG, "Honeywell Galaxy 7 Keypad");
   ESP_LOGCONFIG(TAG, "  Device ID: 0x%02X", this->device_id_);
+  ESP_LOGCONFIG(TAG, "  Prox polling: %s (addr=0x%02X)", this->prox_enabled_ ? "ENABLED" : "disabled", this->prox_id_);
 }
 
 std::pair<std::string, bool> HoneywellGalaxy7Keypad::decode_key_and_tamper_(uint8_t code) {
@@ -352,18 +400,55 @@ void HoneywellGalaxy7Keypad::sync_beep_switch_state_() {
   this->beep_switch_->publish_state(enabled);
 }
 
+void HoneywellGalaxy7Keypad::beep_once_() {
+  // Issue a short beep, then re-apply the stored beep config on the next idle 0C.
+  uint8_t prev_mode   = this->beep_mode_;
+  uint8_t prev_period = this->beep_period_;
+  uint8_t prev_quiet  = this->beep_quiet_period_;
+
+  this->pending_prox_beep_ = true;
+  this->beep_mode_         = prev_mode;
+  this->beep_period_       = prev_period;
+  this->beep_quiet_period_ = prev_quiet;
+  this->beep_set_          = false;  // reapply stored config after the one-shot beep
+}
+
 void HoneywellGalaxy7Keypad::handle_beep_switch_state_(bool state) {
   this->set_beep_enabled(state, this->beep_period_, this->beep_quiet_period_);
 }
 
+void HoneywellGalaxy7Keypad::publish_page_() {
+  if (this->page_sensor_ != nullptr) {
+    this->page_sensor_->publish_state((float) this->page_index_);
+  }
+}
+
+
 void HoneywellGalaxy7Keypad::handle_keypress_(const std::string &key_name, bool tamper) {
   this->bump_backlight_("keypress");
-
+  // A/B as "page" controls
+  if (key_name == "A") {   // > arrow
+    this->page_index_ += 1;
+    ESP_LOGI(TAG, "Page inc -> %d", this->page_index_);
+    this->publish_page_();
+    this->screen_dirty_ = true;
+    return;
+  }
+  if (key_name == "B") {   // < arrow
+    this->page_index_ -= 1;
+    ESP_LOGI(TAG, "Page dec -> %d", this->page_index_);
+    this->publish_page_();
+    this->screen_dirty_ = true;
+    return;
+  }
   if (key_name == "ESC") {
     if (!this->input_buffer_.empty()) {
       this->input_buffer_.clear();
       ESP_LOGI(TAG, "Keypad input cleared (ESC)");
     }
+    this->page_index_ = 0;
+    ESP_LOGI(TAG, "Page reset -> %d", this->page_index_);
+    this->publish_page_();
     this->screen_dirty_ = true;
     return;
   }
@@ -386,7 +471,7 @@ void HoneywellGalaxy7Keypad::handle_keypress_(const std::string &key_name, bool 
       (std::isdigit(static_cast<unsigned char>(key_name[0])) || key_name[0] == '*' || key_name[0] == '#')) {
     this->input_buffer_.push_back(key_name[0]);
     this->screen_dirty_ = true;
-  } else if (key_name == "A" || key_name == "B") {
+  } else if (key_name == "F" || key_name == "G") {
     this->input_buffer_.push_back(key_name[0]);
     this->screen_dirty_ = true;
   }
@@ -467,20 +552,65 @@ void HoneywellGalaxy7Keypad::handle_reply_for_cmd_(const std::vector<uint8_t> &b
   if (this->last_cmd_ == CMD_SCREEN_07 && type == 0xFE && bytes.size() >= 3 && bytes[2] == 0xBA) {
     this->update_tamper_state_(false, "Cleared after screen FE BA");
     ESP_LOGV(TAG, "Screen OK FE BA: %s", bytes_to_hex(bytes).c_str());
+    // ✅ treat FE BA as “screen delivered”, so our key ACK has landed
+    this->key_ack_pending_  = false;
+    this->ack_pending_code_ = 0x00;
+    
     return;
   }
 
   // Beep/backlight ack: FE BA
-  if ((this->last_cmd_ == CMD_BEEP_0C || this->last_cmd_ == CMD_BACKLIGHT_0D) && type == 0xFE && bytes.size() >= 3 &&
-      bytes[2] == 0xBA) {
+  if ((this->last_cmd_ == CMD_BEEP_0C || this->last_cmd_ == CMD_BACKLIGHT_0D || this->last_cmd_ == CMD_BEEP_ONESHOT) &&
+      type == 0xFE && bytes.size() >= 3 && bytes[2] == 0xBA) {
     ESP_LOGV(TAG, "Command ack FE BA: %s", bytes_to_hex(bytes).c_str());
     return;
   }
 
   // --- F4 shared handler ---
-  if (type == 0xF4 && bytes.size() == 4) {
+  if (type == 0xF4 && bytes.size() >= 4) {
     uint8_t code = bytes[2];
-    uint8_t cs   = bytes[3];
+    uint8_t cs   = bytes.back();
+
+    if (this->last_cmd_ == CMD_PROX_POLL) {
+      // Prox replies can be longer; verify checksum against full payload.
+      std::vector<uint8_t> without_cs(bytes.begin(), bytes.end() - 1);
+      uint8_t expected = this->galaxy_checksum_(without_cs);
+      if (expected != cs) {
+        ESP_LOGW(TAG, "[PROX] Bad checksum: %s", bytes_to_hex(bytes).c_str());
+        return;
+      }
+
+      std::vector<uint8_t> prox_payload(bytes.begin() + 2, bytes.end() - 1);
+      if (prox_payload.size() == 1 && prox_payload[0] == 0x10) {
+        ESP_LOGVV(TAG, "[PROX] No card present");
+        return;
+      }
+
+      std::string prox_hex = bytes_to_hex(prox_payload);
+      uint32_t now_ms = millis();
+      bool duplicate = (prox_hex == this->last_prox_payload_) &&
+                       (now_ms - this->last_prox_event_ms_ < PROX_DEBOUNCE_MS);
+      if (duplicate) {
+        ESP_LOGV(TAG, "[PROX] Duplicate within debounce, ignored: %s", prox_hex.c_str());
+        return;
+      }
+
+      this->last_prox_payload_  = prox_hex;
+      this->last_prox_event_ms_ = now_ms;
+
+      ESP_LOGI(TAG, "[PROX] %s", prox_hex.c_str());
+      // Delay the beep until after the current transaction finishes so enqueue won't fail.
+      this->set_timeout("prox_beep_once", 0, [this]() { this->beep_once_(); });
+      // Publish without spaces so HA gets a clean token (e.g., AABBCCDDEE).
+      std::string prox_token;
+      prox_token.reserve(prox_hex.size());
+      for (char ch : prox_hex) {
+        if (ch != ' ')
+          prox_token.push_back(ch);
+      }
+      this->publish_code_(prox_token);
+      return;
+    }
 
     uint8_t expected = this->galaxy_checksum_({KEYPAD_ADDR, 0xF4, code});
     if (expected != cs) {
@@ -504,7 +634,7 @@ void HoneywellGalaxy7Keypad::handle_reply_for_cmd_(const std::vector<uint8_t> &b
         this->key_ack_pending_  = false;
         this->ack_pending_code_ = 0x00;
       } else {
-        ESP_LOGV(TAG, "Screen reply key=%s%s %s",
+        ESP_LOGD(TAG, "Screen reply key=%s%s %s",
                  key_name.c_str(),
                  tamper ? " [TAMPER]" : "",
                  bytes_to_hex(bytes).c_str());

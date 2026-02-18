@@ -50,6 +50,7 @@ honeywell_galaxy7_keypad:
   screen_number: 1         # or address: 0x10
   display_text: "Test|poodle"
   backlight_timeout: 15s
+  prox_poll: true               # enable PROX fob polling
 
   code:
     name: "Galaxy Keypad Code"
@@ -104,7 +105,12 @@ on_boot:
     - lambda: |-
         id(galaxy_keypad).set_beep_enabled(false);     // silence by default
         id(galaxy_keypad).set_backlight_timeout(30000); // 30s backlight
+        id(galaxy_keypad).enable_prox_polling(true);    // enable PROX polling at runtime
 ```
+
+### PROX fobs
+
+- When `prox_poll: true` is set, the component polls the matching PROX address (0x91/0x92/0x93/0x94) for the keypad and publishes detected fobs to the same `code` text sensor as hex (e.g., `AA BB CC DD EE`). Empty replies (`0x10`) are ignored, and duplicates are debounced for 2s. A short beep is emitted on each new tag.
 
 ## Troubleshooting
 

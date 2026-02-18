@@ -1,6 +1,7 @@
 #pragma once
 
 #include "esphome/core/component.h"
+#include "esphome/components/sensor/sensor.h"
 #include "esphome/components/text_sensor/text_sensor.h"
 #include "esphome/components/binary_sensor/binary_sensor.h"
 #include "esphome/components/switch/switch.h"
@@ -22,6 +23,8 @@ enum LastCmd : uint8_t {
   CMD_ACTIVITY_19,
   CMD_BEEP_0C,
   CMD_BACKLIGHT_0D,
+  CMD_BEEP_ONESHOT,
+  CMD_PROX_POLL,
 };
 
 class HoneywellGalaxy7Keypad : public galaxybus::GalaxyBusClient, public Component {
@@ -39,6 +42,7 @@ class HoneywellGalaxy7Keypad : public galaxybus::GalaxyBusClient, public Compone
   void set_display_text_nobl(const std::string &text);
   void set_backlight_timeout(uint32_t timeout_ms) { this->backlight_timeout_ms_ = timeout_ms; }
   void set_beep_enabled(bool enabled, uint8_t beep_period = 0x00, uint8_t quiet_period = 0x00);
+  void enable_prox_polling(bool enabled) { this->prox_enabled_ = enabled; }
 
   bool is_panel_online() const { return this->panel_online_; }
 
@@ -46,10 +50,13 @@ class HoneywellGalaxy7Keypad : public galaxybus::GalaxyBusClient, public Compone
   void set_rx_text_sensor(text_sensor::TextSensor *sens) { this->rx_debug_sens_ = sens; }
   void set_tamper_binary_sensor(binary_sensor::BinarySensor *sens) { this->tamper_sens_ = sens; }
   void set_panel_online_binary_sensor(binary_sensor::BinarySensor *sens) { this->panel_online_sens_ = sens; }
+  void set_page_sensor(sensor::Sensor *sens) { this->page_sensor_ = sens; }
+
   void set_beep_switch(HoneywellBeepSwitch *sw) { this->beep_switch_ = sw; }
 
-  void set_device_id(uint8_t id) { this->device_id_ = id; }
+  void set_device_id(uint8_t id) { this->device_id_ = id; this->prox_id_ = this->compute_prox_id_(); }
   void handle_beep_switch_state_(bool state);
+  uint8_t compute_prox_id_() const;
 
  private:
   galaxybus::GalaxyBus *bus_{nullptr};
@@ -64,7 +71,9 @@ class HoneywellGalaxy7Keypad : public galaxybus::GalaxyBusClient, public Compone
   void update_tamper_state_(bool new_tamper, const std::string &context);
   void update_panel_online_state_(bool online);
   void publish_code_(const std::string &code);
+  void publish_page_();
   void sync_beep_switch_state_();
+  void beep_once_();
   uint8_t galaxy_checksum_(const std::vector<uint8_t> &data);
   void send_frame(const std::vector<uint8_t> &payload, LastCmd cmd);
 
@@ -74,6 +83,10 @@ class HoneywellGalaxy7Keypad : public galaxybus::GalaxyBusClient, public Compone
   binary_sensor::BinarySensor *tamper_sens_{nullptr};
   binary_sensor::BinarySensor *panel_online_sens_{nullptr};
   HoneywellBeepSwitch *beep_switch_{nullptr};
+
+  // Pages
+  int page_index_{0};
+  sensor::Sensor *page_sensor_{nullptr};
 
   // State
   std::string display_text_{"ESP-HOME|Initializing"};
@@ -87,6 +100,8 @@ class HoneywellGalaxy7Keypad : public galaxybus::GalaxyBusClient, public Compone
   uint32_t last_key_ts_{0};
   uint32_t backlight_off_at_{0};
   uint32_t last_panel_rx_ms_{0};
+  uint32_t last_prox_poll_{0};
+  uint32_t last_prox_event_ms_{0};
 
   bool awaiting_reply_{false};
   LastCmd last_cmd_{CMD_NONE};
@@ -98,13 +113,17 @@ class HoneywellGalaxy7Keypad : public galaxybus::GalaxyBusClient, public Compone
   bool backlight_target_on_{false};
   bool in_tamper_{false};
   bool panel_online_{false};
+  bool prox_enabled_{false};
+  bool pending_prox_beep_{false};
 
   std::string last_key_name_;
+  std::string last_prox_payload_;
   bool last_key_tamper_{false};
 
   uint32_t backlight_timeout_ms_{15000};
   uint8_t ack_toggle_{0x02};
   uint8_t device_id_{0x20};
+  uint8_t prox_id_{0x91};
   uint8_t beep_mode_{0x00};
   uint8_t beep_period_{0x00};
   uint8_t beep_quiet_period_{0x00};
