@@ -1,12 +1,12 @@
 # Honeywell Galaxy 7 Keypad (ESPHome)
 
-Custom ESPHome component that emulates a Honeywell Galaxy Mk7 keypad over the RS485 bus. It lets you:
+Custom ESPHome component that talks to a Honeywell Galaxy Mk7 keypad over the RS485 bus, acting as the panel. It lets you:
 
 - Drive the two-line keypad display from Home Assistant or ESPHome automations.
 - Capture keypad keypresses (0–9, A, B, *, #, ESC, ENT) and optionally publish entered codes to a text sensor.
 - Keep the backlight alive while you interact, then time it out automatically.
 - Silence the keypad beep at boot (configurable) and track tamper frames.
-- Pick which keypad address to impersonate (screen 1–4).
+- Pick which keypad address to target (screen 1–4).
 
 ## Installation
 
@@ -91,8 +91,8 @@ binary_sensor:
     name: "Galaxy Keypad ESP Status"
     id: galaxy_keypad_status
   - platform: template
-    name: "Galaxy Panel Online"
-    id: galaxy_panel_online
+    name: "Galaxy Keypad Online"
+    id: galaxy_keypad_online
     lambda: |-
       auto *kp = id(honeywell_galaxy7_keypad_1);
       if (!kp) return {};
@@ -106,7 +106,7 @@ button:
 ```
 
 - Beep switch toggles `set_beep_enabled()` and returns the cached `galaxy_beep_enabled` state (add a `globals:` entry if you want it persisted).
-- `Galaxy Panel Online` mirrors `is_panel_online()` so you can drive HA cards/automations.
+- `Galaxy Keypad Online` mirrors `is_panel_online()` so you can drive HA cards/automations.
 - `Keypad Refresh` gives you a one-tap way to push a known screen.
 
 ### Updating the display from Home Assistant
@@ -145,8 +145,8 @@ on_boot:
 ## Troubleshooting
 
 - Increase `logger:` level to `VERBOSE` to see raw frames and key/tamper messages.
-- Confirm UART pins and 9600 baud. If sharing the bus with a real keypad, keep wiring short and termination sensible.
-- If the panel stops answering, watch for `Panel timeout` logs and power-cycle the RS485 side to resync.
+- Confirm UART pins and 9600 baud.
+- If the keypad stops responding, watch for `Panel timeout` logs and power-cycle the RS485 side to resync.
 
 ## Status
 
