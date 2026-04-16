@@ -26,10 +26,12 @@ external_components:
 
 ## Basic configuration
 
+The keypad attaches to a shared `galaxybus` instance (which itself wraps a UART). Entities (code text sensor, tamper, panel-online, beep switch, page number) are declared directly inside the `honeywell_galaxy7_keypad:` block — no separate top-level `text_sensor:` / `binary_sensor:` / `switch:` templates are required.
+
 ```yaml
 external_components:
   - source: github://<your-username>/esphome-honeywell-galaxy7-keypad@main
-    components: [honeywell_galaxy7_keypad]
+    components: [galaxybus, honeywell_galaxy7_keypad]
 
 uart:
   id: rs485_bus
@@ -39,30 +41,38 @@ uart:
   parity: NONE
   stop_bits: 1
 
-text_sensor:
-  - platform: template
-    id: galaxy_entered_code
-    name: "Galaxy keypad entry"
+galaxybus:
+  id: galaxy_bus
+  uart_id: rs485_bus
+  reply_timeout: 100ms
+  inter_frame_gap: 10ms
 
 honeywell_galaxy7_keypad:
-  id: kp_hall
+  id: honeywell_galaxy7_keypad_1
   bus_id: galaxy_bus
-  screen_number: 1         # or address: 0x10
-  display_text: "Test|poodle"
+  screen_number: 1                   # 1..4 -> 0x10/0x20/0x30/0x40 (or use address: 0x10)
+  display_text: "ESP-HOME|Initializing"
   backlight_timeout: 15s
-  prox_poll: true               # enable PROX fob polling
+  prox_poll: true                    # enable PROX fob polling
 
-  code:
+  code_sensor:
+    id: rs485_rx
     name: "Galaxy Keypad Code"
-
-  tamper:
+  # rx_text_sensor:                  # optional raw RX debug stream
+  #   id: galaxy_rx_debug
+  #   name: "Galaxy RX Debug"
+  page_sensor:
+    id: galaxy_page
+    name: "Galaxy Keypad Page"
+  tamper_sensor:
+    id: galaxy_tamper
     name: "Galaxy Keypad Tamper"
-
-  beep_switch:
-    name: "Galaxy Keypad Beep"
-
-  panel_online:
+  panel_online_sensor:
+    id: galaxy_panel_online
     name: "Galaxy Panel Online"
+  beep_switch:
+    id: galaxy_keypad_beep
+    name: "Galaxy Keypad Beep"
 
 api:
   services:
@@ -70,9 +80,23 @@ api:
       variables:
         msg: string
       then:
-        - lambda: 'id(galaxy_keypad).set_display_text(msg);'
-
+        - lambda: 'id(honeywell_galaxy7_keypad_1).set_display_text(msg);'
 ```
+
+### Configuration keys
+
+- `bus_id` (**required**) — id of a `galaxybus:` instance on the same RS485 UART.
+- `screen_number` (optional, default `1`) — logical keypad 1–4, maps to addresses 0x10/0x20/0x30/0x40.
+- `address` (optional) — raw RS485 address; overrides `screen_number` when set.
+- `display_text` (optional, default `"ESP-HOME|Initializing"`) — initial two-line text; use `|` to split lines.
+- `backlight_timeout` (optional, default `15s`) — how long the backlight stays on after interaction.
+- `prox_poll` (optional, default `false`) — enable polling of the matching PROX address for fob reads.
+- `code_sensor` — text sensor that receives entered codes (and PROX tag hex when enabled).
+- `rx_text_sensor` — optional raw RX debug text sensor.
+- `page_sensor` — numeric sensor exposing the current keypad page.
+- `tamper_sensor` — binary sensor for tamper (`F4 7F`) frames.
+- `panel_online_sensor` — binary sensor that tracks whether the panel is polling us.
+- `beep_switch` — switch to enable/disable the keypad beep.
 
 ### Updating the display from Home Assistant
 
@@ -83,7 +107,7 @@ text_sensor:
     entity_id: input_text.galaxy_keypad_text
     on_value:
       then:
-        - lambda: 'id(galaxy_keypad).set_display_text(x.c_str());'
+        - lambda: 'id(honeywell_galaxy7_keypad_1).set_display_text(x.c_str());'
 ```
 
 Use `A|B` to split the two lines. If no pipe is present, the second line is blank. Use `set_display_text_nobl()` inside a lambda if you want to change text without bumping the backlight.
@@ -91,7 +115,7 @@ Use `A|B` to split the two lines. If no pipe is present, the second line is blan
 ### Key handling
 
 - ESC clears the input buffer and refreshes the screen.
-- ENT publishes the buffered digits/letters to `rs485_rx_id` (if provided), clears the buffer, and briefly clears the sensor again so repeated codes still fire.
+- ENT publishes the buffered digits/letters to the `code_sensor` (if configured), clears the buffer, and briefly clears the sensor again so repeated codes still fire.
 - Other keys are masked with `*` on the second line while you type.
 - The component automatically ACKs keys back to the keypad to stop repeats and tracks tamper (`F4 7F`).
 
@@ -103,14 +127,82 @@ on_boot:
   priority: 800
   then:
     - lambda: |-
-        id(galaxy_keypad).set_beep_enabled(false);     // silence by default
-        id(galaxy_keypad).set_backlight_timeout(30000); // 30s backlight
-        id(galaxy_keypad).enable_prox_polling(true);    // enable PROX polling at runtime
+        id(honeywell_galaxy7_keypad_1).set_beep_enabled(false);     // silence by default
+        id(honeywell_galaxy7_keypad_1).set_backlight_timeout(30000); // 30s backlight
+        id(honeywell_galaxy7_keypad_1).enable_prox_polling(true);    // enable PROX polling at runtime
 ```
 
 ### PROX fobs
 
-- When `prox_poll: true` is set, the component polls the matching PROX address (0x91/0x92/0x93/0x94) for the keypad and publishes detected fobs to the same `code` text sensor as hex (e.g., `AA BB CC DD EE`). Empty replies (`0x10`) are ignored, and duplicates are debounced for 2s. A short beep is emitted on each new tag.
+- When `prox_poll: true` is set, the component polls the matching PROX address (0x91/0x92/0x93/0x94) for the keypad and publishes detected fobs to the configured `code_sensor` as hex (e.g., `AA BB CC DD EE`). Empty replies (`0x10`) are ignored, and duplicates are debounced for 2s. A short beep is emitted on each new tag.
+
+## RemoteIO (RIO)
+
+This repo also includes a simple RemoteIO pair: a panel/master poller and a device/slave responder. The panel polls the RIO over RS485 and exposes inputs, outputs, uptime, and RSSI to Home Assistant.
+
+Panel side (master on the bus):
+
+```yaml
+external_components:
+  - source: github://<your-username>/esphome-honeywell-galaxy7-keypad@main
+    components: [galaxybus, galaxy_rio_panel]
+
+galaxybus:
+  id: galaxy_bus
+  uart_id: rs485_bus
+  reply_timeout: 100ms
+  inter_frame_gap: 10ms
+
+galaxy_rio_panel:
+  id: rio_garage
+  bus_id: galaxy_bus
+  device_id: 0x50
+  poll_interval: 2s
+  status_interval: 2s
+
+  status:
+    uptime_sensor:
+      name: "RIO Uptime"
+    rssi_sensor:
+      name: "RIO RSSI"
+
+  inputs:
+    - name: "RIO In 1"
+    - name: "RIO In 2"
+
+  outputs:
+    - name: "RIO Out 1"
+    - name: "RIO Out 2"
+```
+
+RIO side (device on the bus):
+
+```yaml
+external_components:
+  - source: github://<your-username>/esphome-honeywell-galaxy7-keypad@main
+    components: [galaxy_rio_device]
+
+galaxy_rio_device:
+  id: rio_garage_dev
+  uart_id: rs485
+  device_id: 0x50
+  inter_frame_gap: 10ms
+
+  inputs:
+    - id: KC868-A16-X01
+      invert: true
+      latch: true
+    - id: KC868-A16-X02
+
+  outputs:
+    - id: out_y01
+    - id: out_y02
+```
+
+Notes:
+- `device_id` must match between panel and RIO device.
+- `invert` flips a given input’s logic.
+- `latch` reports an input as active if it went high at any time since the last poll, then clears after the poll reply.
 
 ## Troubleshooting
 
